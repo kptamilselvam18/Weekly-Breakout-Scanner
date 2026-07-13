@@ -1,6 +1,18 @@
 name: Weekly Breakout Scanner
 
 on:
+  schedule:
+    # 9:30 AM & 9:45 AM IST
+    - cron: "0,15 4 * * 1-5"
+
+    # 10:00 AM to 2:45 PM IST (every 15 minutes)
+    - cron: "30,45 4 * * 1-5"
+    - cron: "*/15 5-8 * * 1-5"
+    - cron: "0,15,30,45 9 * * 1-5"
+
+    # 3:00 PM & 3:15 PM IST
+    - cron: "0,15 10 * * 1-5"
+
   workflow_dispatch:
 
 jobs:
