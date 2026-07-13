@@ -23,4 +23,4 @@ jobs:
 
       - name: Run scanner
         run: |
-          python scanner.py --limit 20 --no-charts
+          python scanner.py --no-charts
