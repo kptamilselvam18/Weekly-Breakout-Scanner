@@ -452,7 +452,7 @@ def main(argv=None):
             print("Tip: Adjust parameters in scanner.py or try during a breakout session.")
         return
 
-    # Build ticker universe
+       # Build ticker universe
     if args.tickers:
         tickers = [t if t.upper().endswith(".NS") else f"{t.upper()}.NS" for t in args.tickers]
     else:
@@ -463,10 +463,13 @@ def main(argv=None):
             tickers = tickers[: args.limit]
 
     if not tickers:
-        print("No tickers to scan. Check your network connection or --tickers argument.", file=sys.stderr)
+        print(
+            "No tickers to scan. Check your network connection or --tickers argument.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-        results = run_scan(
+    results = run_scan(
         tickers,
         make_charts=not args.no_charts,
         chart_limit=args.chart_limit,
@@ -475,10 +478,6 @@ def main(argv=None):
     export_results(results)
 
     send_telegram(results)
-
-
-if __name__ == "__main__":
-    main() 
 
 
 if __name__ == "__main__":
