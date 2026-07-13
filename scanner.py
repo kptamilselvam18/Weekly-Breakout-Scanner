@@ -49,6 +49,8 @@ matplotlib.use("Agg")  # non-interactive backend, safe for headless CI/servers
 import matplotlib.pyplot as plt
 import pandas as pd
 import yfinance as yf
+import os
+import requests
 
 warnings.filterwarnings("ignore")
 
@@ -67,6 +69,41 @@ NSE_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 CHARTS_DIR = OUTPUT_DIR / "charts"
+
+def send_telegram(results):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("Telegram secrets not found.")
+        return
+
+    if results:
+        message = "🚨 Weekly Breakout Scanner\n\n"
+        message += f"✅ {len(results)} breakout(s) found\n\n"
+
+        for i, r in enumerate(results, 1):
+            message += (
+                f"{i}. {r['Ticker']}\n"
+                f"💰 Price: ₹{r['Price']}\n"
+                f"📈 Breakout: {r['Breakout%']}%\n"
+                f"📊 RelVol: {r['RelVol']}x\n\n"
+            )
+    else:
+        message = (
+            "🔇 Weekly Breakout Scanner\n\n"
+            "No breakout stocks found.\n\n"
+            f"Scan Time: {datetime.now().strftime('%d-%b-%Y %I:%M %p')}"
+        )
+
+    requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": message
+        },
+        timeout=20
+    )
 
 
 # ── Ticker list ──────────────────────────────────────────────────────────
