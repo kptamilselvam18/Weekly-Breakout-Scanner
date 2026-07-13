@@ -37,6 +37,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import warnings
@@ -48,9 +49,8 @@ import matplotlib
 matplotlib.use("Agg")  # non-interactive backend, safe for headless CI/servers
 import matplotlib.pyplot as plt
 import pandas as pd
-import yfinance as yf
-import os
 import requests
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
@@ -70,7 +70,10 @@ NSE_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 CHARTS_DIR = OUTPUT_DIR / "charts"
 
-def send_telegram(results):
+
+# ── Telegram notification ───────────────────────────────────────────────
+def send_telegram(results: list[dict]) -> None:
+    """Post a summary to Telegram. No-ops if credentials aren't set."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -96,14 +99,16 @@ def send_telegram(results):
             f"Scan Time: {datetime.now().strftime('%d-%b-%Y %I:%M %p')}"
         )
 
-    requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": message
-        },
-        timeout=20
-    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": message},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            print(f"⚠️  Telegram notify failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"⚠️  Telegram notify error: {e}")
 
 
 # ── Ticker list ──────────────────────────────────────────────────────────
@@ -452,7 +457,7 @@ def main(argv=None):
             print("Tip: Adjust parameters in scanner.py or try during a breakout session.")
         return
 
-       # Build ticker universe
+    # Build ticker universe
     if args.tickers:
         tickers = [t if t.upper().endswith(".NS") else f"{t.upper()}.NS" for t in args.tickers]
     else:
