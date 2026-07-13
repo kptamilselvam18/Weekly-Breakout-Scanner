@@ -466,8 +466,15 @@ def main(argv=None):
         print("No tickers to scan. Check your network connection or --tickers argument.", file=sys.stderr)
         sys.exit(1)
 
-    results = run_scan(tickers, make_charts=not args.no_charts, chart_limit=args.chart_limit)
-    export_results(results)
+   results = run_scan(
+    tickers,
+    make_charts=not args.no_charts,
+    chart_limit=args.chart_limit,
+   )
+
+export_results(results)
+
+send_telegram(results)
 
 
 if __name__ == "__main__":
