@@ -43,13 +43,13 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import matplotlib
 
 matplotlib.use("Agg")  # non-interactive backend, safe for headless CI/servers
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
@@ -67,43 +67,76 @@ NEAR_HIGH_PCT = 10.0
 
 NSE_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
+# Networking behavior tuned for shared CI IPs (GitHub Actions), where Yahoo
+# Finance is more prone to blocking/500s than on Colab's Google IPs.
+BATCH_SIZE = 150               # tickers per yf.download() batch call
+REQUEST_RETRIES = 3            # retries for both batch downloads and fast_info lookups
+RETRY_SLEEP_SECONDS = 2.0      # backoff between retries
+BATCH_PAUSE_SECONDS = 1.0      # pause between batches to be gentle on the API
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 CHARTS_DIR = OUTPUT_DIR / "charts"
+IST = ZoneInfo("Asia/Kolkata")
 
 
-# ── Telegram notification ───────────────────────────────────────────────
+# ── Watchlist / market hours helpers ───────────────────────────────────
+def load_watchlist(path: str) -> list[str]:
+    """Load tickers from a plain-text file, one symbol per line (# comments allowed)."""
+    tickers = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            symbol = line.split()[0].upper()
+            tickers.append(symbol if symbol.endswith(".NS") else f"{symbol}.NS")
+    return tickers
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    """True if within NSE cash market hours (Mon-Fri, 09:15-15:30 IST)."""
+    now = now.astimezone(IST) if now else datetime.now(IST)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 15) <= minutes <= (15 * 60 + 30)
+
+
 def send_telegram(results: list[dict]) -> None:
-    """Post a summary to Telegram. No-ops if credentials aren't set."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    """Post a summary to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
 
+    Silently no-ops if either env var is missing, so this is safe to call
+    unconditionally (e.g. from CI where secrets may not be configured).
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Telegram secrets not found.")
         return
 
-    if results:
-        message = "🚨 Weekly Breakout Scanner\n\n"
-        message += f"✅ {len(results)} breakout(s) found\n\n"
+    try:
+        import requests
+    except ImportError:
+        print("⚠️  'requests' not installed — skipping Telegram notification (pip install requests).")
+        return
 
-        for i, r in enumerate(results, 1):
-            message += (
-                f"{i}. {r['Ticker']}\n"
-                f"💰 Price: ₹{r['Price']}\n"
-                f"📈 Breakout: {r['Breakout%']}%\n"
-                f"📊 RelVol: {r['RelVol']}x\n\n"
-            )
+    if not results:
+        text = "⚡ India Breakout Scanner: no breakouts found this run."
     else:
-        message = (
-            "🔇 Weekly Breakout Scanner\n\n"
-            "No breakout stocks found.\n\n"
-            f"Scan Time: {datetime.now().strftime('%d-%b-%Y %I:%M %p')}"
-        )
+        lines = [f"⚡ *India Breakout Scanner* — {len(results)} breakout(s) found\n"]
+        for r in results[:20]:  # keep messages short
+            lines.append(
+                f"• {r['Ticker'].replace('.NS', '')}: ₹{r['Price']:.2f} "
+                f"(+{r['Breakout%']:.1f}%, RelVol {r['RelVol']:.1f}x)"
+            )
+        if len(results) > 20:
+            lines.append(f"... and {len(results) - 20} more (see CSV in Actions artifacts).")
+        text = "\n".join(lines)
 
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat_id, "text": message},
-            timeout=20,
+            data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=15,
         )
         if resp.status_code != 200:
             print(f"⚠️  Telegram notify failed: {resp.status_code} {resp.text}")
@@ -149,26 +182,100 @@ def sma(series: pd.Series, period: int) -> float | None:
     return series.iloc[-period:].mean()
 
 
-def fetch_ticker_data(ticker: str):
-    """Fetch 1yr daily data + info for a ticker."""
+# ── Data fetching (batched, with retries) ──────────────────────────────
+#
+# GitHub Actions runs from shared IPs that Yahoo Finance rate-limits/blocks
+# far more aggressively than Colab's Google IPs. Two changes address this:
+#   1. `obj.info` (a slow, heavy, easily-blocked endpoint) is replaced with
+#      `obj.fast_info`, which is lighter and much less likely to 500.
+#   2. Daily history is fetched in batches via `yf.download(...)` instead of
+#      one `yf.Ticker(t).history()` call per stock — this turns ~2400
+#      requests into ~16 batch requests.
+def download_batch_history(tickers_batch: list[str], retries: int = REQUEST_RETRIES) -> pd.DataFrame | None:
+    """Download 1y daily OHLCV for a batch of tickers in one call, with retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            data = yf.download(
+                tickers=tickers_batch,
+                period="1y",
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+            if data is not None and not data.empty:
+                return data
+        except Exception as e:
+            print(f"  ⚠️  Batch download attempt {attempt}/{retries} failed: {e}")
+        time.sleep(RETRY_SLEEP_SECONDS)
+    return None
+
+
+def extract_ticker_history(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
+    """Pull one ticker's OHLCV frame out of a multi-ticker batch download result."""
     try:
-        obj = yf.Ticker(ticker)
-        hist = obj.history(period="1y", interval="1d", auto_adjust=True)
-        if hist is None or len(hist) < 60:
-            return None, None
-        info = obj.info or {}
-        return hist, info
-    except Exception:
+        if isinstance(batch_data.columns, pd.MultiIndex):
+            hist = batch_data[ticker].dropna(how="all")
+        else:
+            # Only happens if the batch itself contained a single ticker
+            hist = batch_data.dropna(how="all")
+        if hist is None or hist.empty or len(hist) < 60:
+            return None
+        return hist
+    except (KeyError, Exception):
+        return None
+
+
+def fetch_market_cap(ticker: str, retries: int = REQUEST_RETRIES) -> float:
+    """Fetch market cap via the lightweight fast_info endpoint, with retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            for key in ("market_cap", "marketCap"):
+                try:
+                    val = fi[key]
+                    if val:
+                        return float(val)
+                except Exception:
+                    continue
+            val = getattr(fi, "market_cap", None)
+            if val:
+                return float(val)
+            return 0.0
+        except Exception:
+            time.sleep(RETRY_SLEEP_SECONDS)
+    return 0.0
+
+
+def fetch_ticker_data(ticker: str, retries: int = REQUEST_RETRIES):
+    """Single-ticker fetch (history + market cap) with retries. Used for --deep-dive only —
+    the main scan path uses the batched functions above for efficiency."""
+    hist = None
+    for attempt in range(1, retries + 1):
+        try:
+            hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
+            if hist is not None and len(hist) >= 60:
+                break
+            hist = None
+        except Exception as e:
+            print(f"  ⚠️  History fetch attempt {attempt}/{retries} for {ticker} failed: {e}")
+        time.sleep(RETRY_SLEEP_SECONDS)
+
+    if hist is None:
         return None, None
+
+    market_cap = fetch_market_cap(ticker, retries=retries)
+    return hist, {"marketCap": market_cap}
 
 
 # ── 8-Check screening function ─────────────────────────────────────────
-def screen_ticker(ticker: str) -> dict | None:
-    """Run all 8 checks on a ticker. Returns a result dict if it passes, else None."""
-    hist, info = fetch_ticker_data(ticker)
-    if hist is None:
-        return None
+def screen_ticker_core(ticker: str, hist: pd.DataFrame, market_cap: float) -> dict | None:
+    """Run all 8 checks given already-fetched history and market cap.
 
+    Pure computation, no network calls — this is what both the batched
+    scan path and the deep-dive path funnel into.
+    """
     weekly = build_weekly_candles(hist)
     if len(weekly) < CONSOLIDATION_LOOKBACK + 2:
         return None
@@ -207,7 +314,6 @@ def screen_ticker(ticker: str) -> dict | None:
         return None
 
     # 6. Market cap
-    market_cap = info.get("marketCap", 0) or 0
     if market_cap < MIN_MARKET_CAP_INR:
         return None
 
@@ -246,6 +352,20 @@ def screen_ticker(ticker: str) -> dict | None:
         "SMA50": round(sma50, 2),
         "_weekly": weekly,  # for charting only, stripped before export
     }
+
+
+def screen_ticker(ticker: str) -> dict | None:
+    """Fetch + screen a single ticker end-to-end. Used by --deep-dive.
+
+    The main multi-ticker scan does NOT use this — it uses the batched
+    download path in run_scan() for efficiency, then calls
+    screen_ticker_core() directly per ticker.
+    """
+    hist, info = fetch_ticker_data(ticker)
+    if hist is None:
+        return None
+    market_cap = (info or {}).get("marketCap", 0) or 0
+    return screen_ticker_core(ticker, hist, market_cap)
 
 
 # ── Charting ────────────────────────────────────────────────────────────
@@ -346,21 +466,41 @@ def plot_breakout(result: dict, lookback_weeks: int = 20, out_dir: Path = CHARTS
 def run_scan(tickers: list[str], make_charts: bool = True, chart_limit: int = 10) -> list[dict]:
     results, failed = [], []
 
-    print(f"🔍 Scanning {len(tickers)} Indian tickers (Weekly | ₹{MIN_MARKET_CAP_CR}Cr+)...")
-    for i, ticker in enumerate(tickers):
-        try:
-            result = screen_ticker(ticker)
-            if result:
-                results.append(result)
-                print(f"  ✅ {ticker:<20} → Breakout {result['Breakout%']:+.1f}%  RelVol {result['RelVol']:.1f}×")
-            else:
-                print(f"  ○  {ticker}")
-        except Exception as e:
-            failed.append(ticker)
-            print(f"  ✗  {ticker} — {e}")
+    batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    print(
+        f"🔍 Scanning {len(tickers)} Indian tickers (Weekly | ₹{MIN_MARKET_CAP_CR}Cr+) "
+        f"in {len(batches)} batch(es) of up to {BATCH_SIZE}..."
+    )
 
-        if (i + 1) % 5 == 0:
-            time.sleep(0.5)  # be gentle on the API
+    for batch_num, batch in enumerate(batches, 1):
+        print(f"\n📦 Batch {batch_num}/{len(batches)} ({len(batch)} tickers)")
+        batch_data = download_batch_history(batch)
+
+        if batch_data is None:
+            print(f"  ✗  Batch download failed after retries — skipping {len(batch)} tickers")
+            failed.extend(batch)
+            continue
+
+        for ticker in batch:
+            try:
+                hist = extract_ticker_history(batch_data, ticker)
+                if hist is None:
+                    print(f"  ○  {ticker} (no usable data)")
+                    continue
+
+                market_cap = fetch_market_cap(ticker)
+                result = screen_ticker_core(ticker, hist, market_cap)
+                if result:
+                    results.append(result)
+                    print(f"  ✅ {ticker:<20} → Breakout {result['Breakout%']:+.1f}%  RelVol {result['RelVol']:.1f}×")
+                else:
+                    print(f"  ○  {ticker}")
+            except Exception as e:
+                failed.append(ticker)
+                print(f"  ✗  {ticker} — {e}")
+
+        if batch_num < len(batches):
+            time.sleep(BATCH_PAUSE_SECONDS)
 
     results.sort(key=lambda x: x["RelVol"], reverse=True)
 
@@ -418,8 +558,23 @@ def parse_args(argv=None):
         help="Specific NSE symbols to scan (without .NS suffix), e.g. --tickers RELIANCE INFY TCS",
     )
     p.add_argument(
+        "--watchlist", type=str, default=None,
+        help="Path to a text file of NSE symbols (one per line, # comments allowed). "
+             "Recommended for frequent (e.g. every-15-min) runs since a full NSE scan is slow.",
+    )
+    p.add_argument(
         "--limit", type=int, default=None,
         help="Only scan the first N tickers from the full NSE list (useful for a quick test run).",
+    )
+    p.add_argument(
+        "--market-hours-only", action="store_true",
+        help="Exit immediately (before any network calls) if NSE cash market is currently closed "
+             "(Mon-Fri 09:15-15:30 IST). Useful for scheduled jobs that also trigger off-hours.",
+    )
+    p.add_argument(
+        "--notify", action="store_true",
+        help="Send a summary to Telegram after the scan. Requires TELEGRAM_BOT_TOKEN and "
+             "TELEGRAM_CHAT_ID environment variables (e.g. GitHub Actions secrets).",
     )
     p.add_argument(
         "--deep-dive", type=str, default=None,
@@ -439,6 +594,10 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
+    if args.market_hours_only and not is_market_open():
+        print("🕒 NSE market is currently closed (Mon-Fri 09:15-15:30 IST). Skipping this run.")
+        return
+
     # Single-ticker deep dive mode
     if args.deep_dive:
         ticker = args.deep_dive if args.deep_dive.upper().endswith(".NS") else f"{args.deep_dive.upper()}.NS"
@@ -457,9 +616,12 @@ def main(argv=None):
             print("Tip: Adjust parameters in scanner.py or try during a breakout session.")
         return
 
-    # Build ticker universe
+    # Build ticker universe (priority: --tickers > --watchlist > full NSE list)
     if args.tickers:
         tickers = [t if t.upper().endswith(".NS") else f"{t.upper()}.NS" for t in args.tickers]
+    elif args.watchlist:
+        tickers = load_watchlist(args.watchlist)
+        print(f"📋 {len(tickers)} tickers loaded from watchlist: {args.watchlist}")
     else:
         tickers = load_nse_tickers()
         print(f"📋 {len(tickers)} tickers loaded")
@@ -468,21 +630,14 @@ def main(argv=None):
             tickers = tickers[: args.limit]
 
     if not tickers:
-        print(
-            "No tickers to scan. Check your network connection or --tickers argument.",
-            file=sys.stderr,
-        )
+        print("No tickers to scan. Check your network connection, --tickers, or --watchlist argument.", file=sys.stderr)
         sys.exit(1)
 
-    results = run_scan(
-        tickers,
-        make_charts=not args.no_charts,
-        chart_limit=args.chart_limit,
-    )
-
+    results = run_scan(tickers, make_charts=not args.no_charts, chart_limit=args.chart_limit)
     export_results(results)
 
-    send_telegram(results)
+    if args.notify:
+        send_telegram(results)
 
 
 if __name__ == "__main__":
