@@ -102,35 +102,19 @@ def is_market_open(now: datetime | None = None) -> bool:
     return (9 * 60 + 15) <= minutes <= (15 * 60 + 30)
 
 
-def send_telegram(results: list[dict]) -> None:
-    """Post a summary to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
-
-    Silently no-ops if either env var is missing, so this is safe to call
-    unconditionally (e.g. from CI where secrets may not be configured).
-    """
+def _telegram_send(text: str) -> bool:
+    """Low-level Telegram sender. Returns True on success, False otherwise (never raises)."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        return
+        print("⚠️  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping Telegram notification.")
+        return False
 
     try:
         import requests
     except ImportError:
         print("⚠️  'requests' not installed — skipping Telegram notification (pip install requests).")
-        return
-
-    if not results:
-        text = "⚡ India Breakout Scanner: no breakouts found this run."
-    else:
-        lines = [f"⚡ *India Breakout Scanner* — {len(results)} breakout(s) found\n"]
-        for r in results[:20]:  # keep messages short
-            lines.append(
-                f"• {r['Ticker'].replace('.NS', '')}: ₹{r['Price']:.2f} "
-                f"(+{r['Breakout%']:.1f}%, RelVol {r['RelVol']:.1f}x)"
-            )
-        if len(results) > 20:
-            lines.append(f"... and {len(results) - 20} more (see CSV in Actions artifacts).")
-        text = "\n".join(lines)
+        return False
 
     try:
         resp = requests.post(
@@ -140,8 +124,73 @@ def send_telegram(results: list[dict]) -> None:
         )
         if resp.status_code != 200:
             print(f"⚠️  Telegram notify failed: {resp.status_code} {resp.text}")
+            return False
+        print("✅ Telegram notification sent.")
+        return True
     except Exception as e:
         print(f"⚠️  Telegram notify error: {e}")
+        return False
+
+
+def send_telegram(results: list[dict], failed: list[str] | None = None, total: int | None = None) -> None:
+    """Post a scan summary to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
+
+    Produces a different message depending on outcome:
+      - Total failure (every ticker failed to fetch) -> failure alert
+      - No breakouts found (scan ran fine, just nothing matched) -> "no breakouts"
+      - Breakouts found -> list of results
+
+    Silently no-ops if either env var is missing, so this is safe to call
+    unconditionally (e.g. from CI where secrets may not be configured).
+    """
+    failed = failed or []
+    now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M %p IST")
+
+    if total is not None and total > 0 and len(failed) == total:
+        text = (
+            f"🔴 *India Breakout Scanner* — scan FAILED\n\n"
+            f"All {total} ticker(s) failed to fetch data (Yahoo Finance "
+            f"errors/rate-limit likely). No screening was performed.\n"
+            f"{now_ist}"
+        )
+    elif not results:
+        text = f"⚡ India Breakout Scanner: no breakouts found this run.\n{now_ist}"
+        if failed:
+            text += f"\n⚠️ {len(failed)} ticker(s) failed to fetch."
+    else:
+        lines = [f"⚡ *India Breakout Scanner* — {len(results)} breakout(s) found\n"]
+        for r in results[:20]:  # keep messages short
+            lines.append(
+                f"• {r['Ticker'].replace('.NS', '')}: ₹{r['Price']:.2f} "
+                f"(+{r['Breakout%']:.1f}%, RelVol {r['RelVol']:.1f}x)"
+            )
+        if len(results) > 20:
+            lines.append(f"... and {len(results) - 20} more (see CSV in Actions artifacts).")
+        if failed:
+            lines.append(f"\n⚠️ {len(failed)} ticker(s) failed to fetch.")
+        lines.append(f"\n{now_ist}")
+        text = "\n".join(lines)
+
+    _telegram_send(text)
+
+
+def send_telegram_skip(reason: str) -> None:
+    """Notify that a scheduled run was skipped without scanning (e.g. market closed)."""
+    now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M %p IST")
+    text = f"🕒 India Breakout Scanner — run skipped\n{reason}\n{now_ist}"
+    _telegram_send(text)
+
+
+def send_test_ping() -> bool:
+    """Send a simple 'scanner is alive' message, regardless of scan results.
+
+    Use `--notify-test` to trigger this without waiting for a real breakout —
+    useful for confirming TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are wired up
+    correctly end-to-end (locally or in GitHub Actions).
+    """
+    now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M %p IST")
+    text = f"🟢 India Breakout Scanner — test ping\nScanner pipeline is alive.\n{now_ist}"
+    return _telegram_send(text)
 
 
 # ── Ticker list ──────────────────────────────────────────────────────────
@@ -463,7 +512,7 @@ def plot_breakout(result: dict, lookback_weeks: int = 20, out_dir: Path = CHARTS
 
 
 # ── Scan orchestration ──────────────────────────────────────────────────
-def run_scan(tickers: list[str], make_charts: bool = True, chart_limit: int = 10) -> list[dict]:
+def run_scan(tickers: list[str], make_charts: bool = True, chart_limit: int = 10) -> tuple[list[dict], list[str]]:
     results, failed = [], []
 
     batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
@@ -527,7 +576,7 @@ def run_scan(tickers: list[str], make_charts: bool = True, chart_limit: int = 10
     else:
         print("🔇 No breakouts found. Try again in a different market session.")
 
-    return results
+    return results, failed
 
 
 def export_results(results: list[dict], out_dir: Path = OUTPUT_DIR) -> Path | None:
@@ -577,6 +626,12 @@ def parse_args(argv=None):
              "TELEGRAM_CHAT_ID environment variables (e.g. GitHub Actions secrets).",
     )
     p.add_argument(
+        "--notify-test", action="store_true",
+        help="Send a simple 'scanner is alive' ping to Telegram and exit immediately — "
+             "no scanning, no network calls to Yahoo Finance. Use this to verify "
+             "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are configured correctly.",
+    )
+    p.add_argument(
         "--deep-dive", type=str, default=None,
         help="Run a single-ticker deep dive (e.g. --deep-dive RELIANCE.NS) and print all check results.",
     )
@@ -594,8 +649,15 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
+    if args.notify_test:
+        ok = send_test_ping()
+        sys.exit(0 if ok else 1)
+
     if args.market_hours_only and not is_market_open():
-        print("🕒 NSE market is currently closed (Mon-Fri 09:15-15:30 IST). Skipping this run.")
+        msg = "NSE market is currently closed (Mon-Fri 09:15-15:30 IST)."
+        print(f"🕒 {msg} Skipping this run.")
+        if args.notify:
+            send_telegram_skip(msg)
         return
 
     # Single-ticker deep dive mode
@@ -630,14 +692,24 @@ def main(argv=None):
             tickers = tickers[: args.limit]
 
     if not tickers:
-        print("No tickers to scan. Check your network connection, --tickers, or --watchlist argument.", file=sys.stderr)
+        msg = "No tickers to scan. Check your network connection, --tickers, or --watchlist argument."
+        print(msg, file=sys.stderr)
+        if args.notify:
+            send_telegram_skip(msg)
         sys.exit(1)
 
-    results = run_scan(tickers, make_charts=not args.no_charts, chart_limit=args.chart_limit)
+    try:
+        results, failed = run_scan(tickers, make_charts=not args.no_charts, chart_limit=args.chart_limit)
+    except Exception as e:
+        print(f"✗ Scan crashed: {e}", file=sys.stderr)
+        if args.notify:
+            send_telegram(results=[], failed=tickers, total=len(tickers))
+        raise
+
     export_results(results)
 
     if args.notify:
-        send_telegram(results)
+        send_telegram(results, failed=failed, total=len(tickers))
 
 
 if __name__ == "__main__":
