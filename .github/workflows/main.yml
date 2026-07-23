@@ -2,24 +2,30 @@ name: Weekly Breakout Scanner
 
 on:
   schedule:
-    # 9:30 AM & 9:45 AM IST
-    - cron: "0,15 4 * * 1-5"
-    # 10:00 AM to 2:45 PM IST (every 15 minutes)
-    - cron: "30,45 4 * * 1-5"
-    - cron: "*/15 5-8 * * 1-5"
-    - cron: "0,15,30,45 9 * * 1-5"
-    # 3:00 PM & 3:15 PM IST
-    - cron: "0,15 10 * * 1-5"
+    # ── NSE market hours: 9:15 AM – 3:30 PM IST (UTC = IST − 5:30)
+    # Every 3 hours during market hours, on weekdays only
+    #
+    # 09:15 AM IST = 03:45 UTC  → market open scan
+    - cron: "45 3 * * 1-5"
+    # 12:15 PM IST = 06:45 UTC  → midday scan (+3 h)
+    - cron: "45 6 * * 1-5"
+    # 03:15 PM IST = 09:45 UTC  → pre-close scan (+3 h)
+    - cron: "45 9 * * 1-5"
+    # 03:30 PM IST = 10:00 UTC  → market close EOD scan
+    - cron: "0 10 * * 1-5"
+
+  # Allow manual trigger from the Actions tab
   workflow_dispatch: {}
 
 concurrency:
   group: weekly-breakout-scanner
-  cancel-in-progress: true   # if a run is still going when the next 15-min trigger fires, cancel it
+  cancel-in-progress: true   # cancel the old run if a new hour fires before it finishes
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 55      # 1-hour scans may take up to ~50 min for 500 tickers
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
